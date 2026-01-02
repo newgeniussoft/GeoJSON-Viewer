@@ -6,13 +6,14 @@ Optimized for handling large datasets with pagination and lazy loading
 
 import sys
 import json
+import tempfile
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, 
     QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, 
     QFileDialog, QLineEdit, QMessageBox, QHeaderView, QProgressBar,
     QSpinBox, QComboBox, QDialog, QDialogButtonBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt5.QtGui import QFont, QKeySequence
 import os
 try:
@@ -21,6 +22,13 @@ try:
     SHAPELY_AVAILABLE = True
 except ImportError:
     SHAPELY_AVAILABLE = False
+
+try:
+    import folium
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    FOLIUM_AVAILABLE = False
 
 
 class GeoJSONLoader(QThread):
@@ -186,6 +194,13 @@ class GeoJSONViewer(QMainWindow):
         self.merge_btn.setStyleSheet("font-weight: bold; color: blue;")
         self.merge_btn.setToolTip('Union child polygons by parent attribute')
         top_layout.addWidget(self.merge_btn)
+        
+        self.map_btn = QPushButton('View Map')
+        self.map_btn.clicked.connect(self.show_map)
+        self.map_btn.setEnabled(False)
+        self.map_btn.setStyleSheet("font-weight: bold; color: purple;")
+        self.map_btn.setToolTip('Display polygons on interactive map')
+        top_layout.addWidget(self.map_btn)
         
         self.save_status_label = QLabel('')
         self.save_status_label.setStyleSheet("color: blue; font-style: italic;")
@@ -387,6 +402,10 @@ class GeoJSONViewer(QMainWindow):
         # Enable merge button if shapely is available and we have geometry
         if SHAPELY_AVAILABLE and self.original_geojson:
             self.merge_btn.setEnabled(True)
+        
+        # Enable map button if folium is available and we have geometry
+        if FOLIUM_AVAILABLE and self.original_geojson:
+            self.map_btn.setEnabled(True)
         
         self.display_page()
         self.update_pagination_controls()
@@ -1222,6 +1241,132 @@ class GeoJSONViewer(QMainWindow):
                 self,
                 'Merge Error',
                 f'Failed to merge polygons:\n{str(e)}'
+            )
+    
+    def show_map(self):
+        """Display GeoJSON polygons on an interactive map"""
+        if not FOLIUM_AVAILABLE:
+            QMessageBox.warning(
+                self,
+                'Folium Not Installed',
+                'The folium library is required for map visualization.\n\n'
+                'Install it with: pip install folium>=0.14.0 PyQtWebEngine>=5.15.0'
+            )
+            return
+        
+        if not self.original_geojson or 'features' not in self.original_geojson:
+            QMessageBox.warning(
+                self,
+                'No Geometry Data',
+                'No GeoJSON geometry data found. Please load a valid GeoJSON file with features.'
+            )
+            return
+        
+        try:
+            features = self.original_geojson.get('features', [])
+            
+            if not features:
+                QMessageBox.warning(self, 'No Features', 'No features found in GeoJSON.')
+                return
+            
+            # Calculate center of all features
+            lats, lons = [], []
+            for feature in features:
+                geom = feature.get('geometry', {})
+                if geom and geom.get('type') in ['Polygon', 'MultiPolygon']:
+                    coords = geom.get('coordinates', [])
+                    if geom['type'] == 'Polygon':
+                        for coord in coords[0]:  # First ring (exterior)
+                            lons.append(coord[0])
+                            lats.append(coord[1])
+                    elif geom['type'] == 'MultiPolygon':
+                        for polygon in coords:
+                            for coord in polygon[0]:  # First ring of each polygon
+                                lons.append(coord[0])
+                                lats.append(coord[1])
+            
+            if not lats or not lons:
+                QMessageBox.warning(self, 'No Coordinates', 'No valid polygon coordinates found.')
+                return
+            
+            # Calculate center
+            center_lat = sum(lats) / len(lats)
+            center_lon = sum(lons) / len(lons)
+            
+            # Create folium map
+            m = folium.Map(
+                location=[center_lat, center_lon],
+                zoom_start=8,
+                tiles='OpenStreetMap'
+            )
+            
+            # Add GeoJSON layer with styling
+            folium.GeoJson(
+                self.original_geojson,
+                name='GeoJSON Polygons',
+                style_function=lambda x: {
+                    'fillColor': '#3388ff',
+                    'color': '#000000',
+                    'weight': 2,
+                    'fillOpacity': 0.4
+                },
+                highlight_function=lambda x: {
+                    'fillColor': '#ffff00',
+                    'color': '#ff0000',
+                    'weight': 3,
+                    'fillOpacity': 0.7
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=list(self.all_keys[:5]),  # Show first 5 properties
+                    aliases=[f'{key}:' for key in self.all_keys[:5]],
+                    localize=True
+                )
+            ).add_to(m)
+            
+            # Add layer control
+            folium.LayerControl().add_to(m)
+            
+            # Save map to temporary HTML file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+                m.save(f.name)
+                map_file = f.name
+            
+            # Create map viewer window
+            self.map_window = QDialog(self)
+            self.map_window.setWindowTitle('GeoJSON Map Viewer')
+            self.map_window.setGeometry(100, 100, 1000, 700)
+            
+            layout = QVBoxLayout()
+            
+            # Info label
+            info_label = QLabel(
+                f'Displaying {len(features)} polygon(s) | '
+                f'Hover over polygons to see properties | '
+                f'Scroll to zoom, drag to pan'
+            )
+            info_label.setStyleSheet('padding: 5px; background-color: #f0f0f0;')
+            layout.addWidget(info_label)
+            
+            # Web view for map
+            web_view = QWebEngineView()
+            web_view.setUrl(QUrl.fromLocalFile(map_file))
+            layout.addWidget(web_view)
+            
+            # Close button
+            close_btn = QPushButton('Close')
+            close_btn.clicked.connect(self.map_window.close)
+            layout.addWidget(close_btn)
+            
+            self.map_window.setLayout(layout)
+            self.map_window.show()
+            
+            self.statusBar().showMessage(f'Map displayed with {len(features)} polygons')
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                'Map Error',
+                f'Failed to display map:\n{str(e)}'
             )
 
 
