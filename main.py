@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, 
     QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, 
     QFileDialog, QLineEdit, QMessageBox, QHeaderView, QProgressBar,
-    QSpinBox, QComboBox, QDialog, QDialogButtonBox
+    QSpinBox, QComboBox, QDialog, QDialogButtonBox, QListWidget, 
+    QListWidgetItem, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt5.QtGui import QFont, QKeySequence
@@ -202,11 +203,23 @@ class GeoJSONViewer(QMainWindow):
         self.map_btn.setToolTip('Display polygons on interactive map')
         top_layout.addWidget(self.map_btn)
         
+        self.remove_keys_btn = QPushButton('Remove Keys')
+        self.remove_keys_btn.clicked.connect(self.remove_keys_dialog)
+        self.remove_keys_btn.setEnabled(False)
+        self.remove_keys_btn.setStyleSheet("font-weight: bold; color: orange;")
+        self.remove_keys_btn.setToolTip('Remove selected keys from JSON')
+        top_layout.addWidget(self.remove_keys_btn)
+        
+        self.export_minified_btn = QPushButton('Export Minified')
+        self.export_minified_btn.clicked.connect(self.export_minified)
+        self.export_minified_btn.setEnabled(False)
+        self.export_minified_btn.setStyleSheet("font-weight: bold; color: darkgreen;")
+        self.export_minified_btn.setToolTip('Export as minified JSON (smaller file size)')
+        top_layout.addWidget(self.export_minified_btn)
+        
         self.save_status_label = QLabel('')
         self.save_status_label.setStyleSheet("color: blue; font-style: italic;")
         top_layout.addWidget(self.save_status_label)
-        
-        top_layout.addStretch()
         
         main_layout.addLayout(top_layout)
         
@@ -406,6 +419,10 @@ class GeoJSONViewer(QMainWindow):
         # Enable map button if folium is available and we have geometry
         if FOLIUM_AVAILABLE and self.original_geojson:
             self.map_btn.setEnabled(True)
+        
+        # Enable remove keys and export minified buttons
+        self.remove_keys_btn.setEnabled(True)
+        self.export_minified_btn.setEnabled(True)
         
         self.display_page()
         self.update_pagination_controls()
@@ -1367,6 +1384,243 @@ class GeoJSONViewer(QMainWindow):
                 self,
                 'Map Error',
                 f'Failed to display map:\n{str(e)}'
+            )
+    
+    def remove_keys_dialog(self):
+        """Show dialog to select keys to remove from JSON"""
+        if not self.all_keys:
+            QMessageBox.warning(
+                self,
+                'No Data',
+                'No data loaded. Please load a GeoJSON file first.'
+            )
+            return
+        
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Remove Keys from JSON')
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel(
+            'Select the keys you want to REMOVE from the JSON.\n'
+            'These keys and their values will be deleted from all records.'
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet('font-weight: bold; color: red; padding: 10px;')
+        layout.addWidget(instructions)
+        
+        # Key selection list
+        key_list = QListWidget()
+        key_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        
+        for key in self.all_keys:
+            item = QListWidgetItem(key)
+            key_list.addItem(item)
+        
+        layout.addWidget(QLabel('Select keys to remove:'))
+        layout.addWidget(key_list)
+        
+        # Count label
+        count_label = QLabel('0 keys selected')
+        count_label.setStyleSheet('color: gray;')
+        layout.addWidget(count_label)
+        
+        # Update count on selection change
+        def update_count():
+            selected_count = len(key_list.selectedItems())
+            count_label.setText(f'{selected_count} key{"s" if selected_count != 1 else ""} selected')
+            count_label.setStyleSheet('color: red; font-weight: bold;' if selected_count > 0 else 'color: gray;')
+        
+        key_list.itemSelectionChanged.connect(update_count)
+        
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            selected_keys = [item.text() for item in key_list.selectedItems()]
+            if selected_keys:
+                self.remove_keys(selected_keys)
+            else:
+                QMessageBox.information(self, 'No Selection', 'No keys were selected for removal.')
+    
+    def remove_keys(self, keys_to_remove):
+        """Remove specified keys from all data records"""
+        if not keys_to_remove:
+            return
+        
+        # Confirm removal
+        reply = QMessageBox.question(
+            self,
+            'Confirm Key Removal',
+            f'Are you sure you want to remove {len(keys_to_remove)} key(s) from all {len(self.all_data)} records?\n\n'
+            f'Keys to remove: {", ".join(keys_to_remove)}\n\n'
+            f'This action will modify your data.',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        try:
+            # Remove keys from all_data
+            for row in self.all_data:
+                for key in keys_to_remove:
+                    if key in row:
+                        del row[key]
+            
+            # Remove keys from filtered_data (which references all_data)
+            # No need to explicitly remove since filtered_data references all_data rows
+            
+            # Update all_keys list
+            self.all_keys = [key for key in self.all_keys if key not in keys_to_remove]
+            
+            # Update original_geojson if it exists
+            if self.original_geojson and 'features' in self.original_geojson:
+                for feature in self.original_geojson['features']:
+                    if 'properties' in feature:
+                        for key in keys_to_remove:
+                            if key in feature['properties']:
+                                del feature['properties'][key]
+            
+            # Mark as modified
+            self.data_modified = True
+            self.save_btn.setEnabled(True)
+            
+            # Refresh display
+            self.display_page()
+            
+            # Update status
+            self.statusBar().showMessage(f'Removed {len(keys_to_remove)} key(s) from {len(self.all_data)} records')
+            self.file_label.setText(f'Loaded: {len(self.all_data)} records with {len(self.all_keys)} columns')
+            
+            QMessageBox.information(
+                self,
+                'Keys Removed',
+                f'Successfully removed {len(keys_to_remove)} key(s) from all records.\n\n'
+                f'Remember to save your changes.'
+            )
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                'Error',
+                f'Failed to remove keys:\n{str(e)}'
+            )
+    
+    def export_minified(self):
+        """Export GeoJSON as minified (no indentation) for smaller file size"""
+        if not self.all_data:
+            QMessageBox.warning(
+                self,
+                'No Data',
+                'No data loaded. Please load a GeoJSON file first.'
+            )
+            return
+        
+        # Ask user where to save
+        default_name = ''
+        if self.current_file_path:
+            base_name = os.path.splitext(self.current_file_path)[0]
+            default_name = base_name + '_minified.json'
+        else:
+            default_name = 'minified.geojson'
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export Minified GeoJSON',
+            default_name,
+            'GeoJSON Files (*.json *.geojson);;All Files (*)'
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Prepare data to export
+            if self.original_geojson:
+                # Update the original GeoJSON with current data
+                if 'features' in self.original_geojson:
+                    for i, feature in enumerate(self.original_geojson['features']):
+                        if i < len(self.all_data):
+                            if 'properties' in feature:
+                                feature['properties'] = self.all_data[i]
+                            else:
+                                self.original_geojson['features'][i] = self.all_data[i]
+                export_data = self.original_geojson
+            else:
+                # Create basic GeoJSON structure
+                export_data = {
+                    'type': 'FeatureCollection',
+                    'features': [
+                        {
+                            'type': 'Feature',
+                            'properties': row,
+                            'geometry': None
+                        } for row in self.all_data
+                    ]
+                }
+            
+            # Calculate file sizes for comparison
+            import io
+            
+            # Normal size (with indentation)
+            normal_buffer = io.StringIO()
+            json.dump(export_data, normal_buffer, ensure_ascii=False, indent=2)
+            normal_size = len(normal_buffer.getvalue().encode('utf-8'))
+            
+            # Minified size (no indentation)
+            minified_buffer = io.StringIO()
+            json.dump(export_data, minified_buffer, ensure_ascii=False, separators=(',', ':'))
+            minified_size = len(minified_buffer.getvalue().encode('utf-8'))
+            
+            # Save minified version
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, ensure_ascii=False, separators=(',', ':'))
+            
+            # Calculate size reduction
+            size_reduction = normal_size - minified_size
+            reduction_percent = (size_reduction / normal_size * 100) if normal_size > 0 else 0
+            
+            # Format sizes for display
+            def format_size(size_bytes):
+                if size_bytes < 1024:
+                    return f'{size_bytes} B'
+                elif size_bytes < 1024 * 1024:
+                    return f'{size_bytes / 1024:.2f} KB'
+                else:
+                    return f'{size_bytes / (1024 * 1024):.2f} MB'
+            
+            self.statusBar().showMessage(
+                f'Exported minified JSON: {format_size(minified_size)} '
+                f'(saved {format_size(size_reduction)}, {reduction_percent:.1f}% smaller)'
+            )
+            
+            QMessageBox.information(
+                self,
+                'Export Complete',
+                f'Successfully exported minified GeoJSON!\n\n'
+                f'File: {os.path.basename(file_path)}\n'
+                f'Normal size: {format_size(normal_size)}\n'
+                f'Minified size: {format_size(minified_size)}\n'
+                f'Size reduction: {format_size(size_reduction)} ({reduction_percent:.1f}% smaller)'
+            )
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                'Export Error',
+                f'Failed to export minified JSON:\n{str(e)}'
             )
 
 
