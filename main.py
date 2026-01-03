@@ -107,34 +107,86 @@ class GeoJSONSaver(QThread):
         
     def run(self):
         try:
+            import copy
+            
             self.progress.emit(10, 'Preparing data...')
             
+            # Create a deep copy to avoid modifying the original
+            data_to_save = copy.deepcopy(self.original_data)
+            
             # Update the properties in features
-            if 'features' in self.original_data:
-                total = len(self.original_data['features'])
-                for i, feature in enumerate(self.original_data['features']):
+            if 'features' in data_to_save:
+                total = len(data_to_save['features'])
+                for i, feature in enumerate(data_to_save['features']):
                     if i < len(self.updated_data):
                         if 'properties' in feature:
                             feature['properties'] = self.updated_data[i]
                         else:
-                            self.original_data['features'][i] = self.updated_data[i]
+                            data_to_save['features'][i] = self.updated_data[i]
                     
                     if i % 100 == 0:
                         progress_percent = 10 + int((i / total) * 40)
                         self.progress.emit(progress_percent, f'Processing {i}/{total} records...')
-            elif isinstance(self.original_data, list):
-                self.original_data = self.updated_data
+            elif isinstance(data_to_save, list):
+                data_to_save = self.updated_data
             else:
-                self.original_data = self.updated_data[0] if self.updated_data else {}
+                data_to_save = self.updated_data[0] if self.updated_data else {}
             
             self.progress.emit(60, 'Writing to file...')
             
             # Save to file
             with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.original_data, f, ensure_ascii=False, indent=2)
+                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
             
             self.progress.emit(100, 'Save complete!')
             self.finished.emit(os.path.basename(self.file_path))
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class MinifiedExporter(QThread):
+    """Background thread for exporting minified GeoJSON without blocking UI"""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(str, int, int, int)
+    error = pyqtSignal(str)
+    
+    def __init__(self, file_path, export_data):
+        super().__init__()
+        self.file_path = file_path
+        self.export_data = export_data
+        
+    def run(self):
+        try:
+            import io
+            
+            self.progress.emit(10, 'Calculating normal size...')
+            
+            # Normal size (with indentation)
+            normal_buffer = io.StringIO()
+            json.dump(self.export_data, normal_buffer, ensure_ascii=False, indent=2)
+            normal_size = len(normal_buffer.getvalue().encode('utf-8'))
+            
+            self.progress.emit(30, 'Calculating minified size...')
+            
+            # Minified size (no indentation)
+            minified_buffer = io.StringIO()
+            json.dump(self.export_data, minified_buffer, ensure_ascii=False, separators=(',', ':'))
+            minified_size = len(minified_buffer.getvalue().encode('utf-8'))
+            
+            self.progress.emit(60, 'Writing minified file...')
+            
+            # Save minified version
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.export_data, f, ensure_ascii=False, separators=(',', ':'))
+            
+            self.progress.emit(90, 'Finalizing...')
+            
+            # Calculate size reduction
+            size_reduction = normal_size - minified_size
+            
+            self.progress.emit(100, 'Export complete!')
+            self.finished.emit(self.file_path, normal_size, minified_size, size_reduction)
             
         except Exception as e:
             self.error.emit(str(e))
@@ -210,12 +262,26 @@ class GeoJSONViewer(QMainWindow):
         self.remove_keys_btn.setToolTip('Remove selected keys from JSON')
         top_layout.addWidget(self.remove_keys_btn)
         
+        self.rename_keys_btn = QPushButton('Rename Keys')
+        self.rename_keys_btn.clicked.connect(self.rename_keys_dialog)
+        self.rename_keys_btn.setEnabled(False)
+        self.rename_keys_btn.setStyleSheet("font-weight: bold; color: darkorange;")
+        self.rename_keys_btn.setToolTip('Rename keys in JSON')
+        top_layout.addWidget(self.rename_keys_btn)
+        
         self.export_minified_btn = QPushButton('Export Minified')
         self.export_minified_btn.clicked.connect(self.export_minified)
         self.export_minified_btn.setEnabled(False)
         self.export_minified_btn.setStyleSheet("font-weight: bold; color: darkgreen;")
         self.export_minified_btn.setToolTip('Export as minified JSON (smaller file size)')
         top_layout.addWidget(self.export_minified_btn)
+        
+        self.export_coords_btn = QPushButton('Export Coordinates')
+        self.export_coords_btn.clicked.connect(self.export_coordinates_dialog)
+        self.export_coords_btn.setEnabled(False)
+        self.export_coords_btn.setStyleSheet("font-weight: bold; color: teal;")
+        self.export_coords_btn.setToolTip('Export center coordinates (lat, long) from polygons')
+        top_layout.addWidget(self.export_coords_btn)
         
         self.save_status_label = QLabel('')
         self.save_status_label.setStyleSheet("color: blue; font-style: italic;")
@@ -420,9 +486,14 @@ class GeoJSONViewer(QMainWindow):
         if FOLIUM_AVAILABLE and self.original_geojson:
             self.map_btn.setEnabled(True)
         
-        # Enable remove keys and export minified buttons
+        # Enable remove keys, rename keys and export minified buttons
         self.remove_keys_btn.setEnabled(True)
+        self.rename_keys_btn.setEnabled(True)
         self.export_minified_btn.setEnabled(True)
+        
+        # Enable export coordinates if we have geometry
+        if self.original_geojson:
+            self.export_coords_btn.setEnabled(True)
         
         self.display_page()
         self.update_pagination_controls()
@@ -1518,6 +1589,167 @@ class GeoJSONViewer(QMainWindow):
                 f'Failed to remove keys:\n{str(e)}'
             )
     
+    def rename_keys_dialog(self):
+        """Show dialog to rename keys in JSON"""
+        if not self.all_keys:
+            QMessageBox.warning(
+                self,
+                'No Data',
+                'No data loaded. Please load a GeoJSON file first.'
+            )
+            return
+        
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Rename Keys in JSON')
+        dialog.setMinimumWidth(600)
+        dialog.setMinimumHeight(500)
+        
+        layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel(
+            'Select keys to rename and provide new names.\n'
+            'Leave "New Name" empty to keep the original name.'
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet('font-weight: bold; padding: 10px;')
+        layout.addWidget(instructions)
+        
+        # Create a scrollable area for key renaming
+        from PyQt5.QtWidgets import QScrollArea, QGridLayout
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        grid_layout = QGridLayout()
+        
+        # Headers
+        grid_layout.addWidget(QLabel('<b>Current Key Name</b>'), 0, 0)
+        grid_layout.addWidget(QLabel('<b>New Key Name</b>'), 0, 1)
+        
+        # Create input fields for each key
+        rename_inputs = {}
+        for idx, key in enumerate(self.all_keys, start=1):
+            current_label = QLabel(key)
+            current_label.setStyleSheet('padding: 5px;')
+            new_input = QLineEdit()
+            new_input.setPlaceholderText(f'Enter new name for "{key}"...')
+            
+            grid_layout.addWidget(current_label, idx, 0)
+            grid_layout.addWidget(new_input, idx, 1)
+            
+            rename_inputs[key] = new_input
+        
+        scroll_widget.setLayout(grid_layout)
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        # Count label
+        count_label = QLabel('Enter new names for keys you want to rename')
+        count_label.setStyleSheet('color: gray; padding: 5px;')
+        layout.addWidget(count_label)
+        
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            # Collect rename mappings
+            rename_map = {}
+            for old_key, input_field in rename_inputs.items():
+                new_key = input_field.text().strip()
+                if new_key and new_key != old_key:
+                    rename_map[old_key] = new_key
+            
+            if rename_map:
+                self.rename_keys(rename_map)
+            else:
+                QMessageBox.information(self, 'No Changes', 'No keys were renamed.')
+    
+    def rename_keys(self, rename_map):
+        """Rename specified keys in all data records"""
+        if not rename_map:
+            return
+        
+        # Check for conflicts
+        conflicts = []
+        for old_key, new_key in rename_map.items():
+            if new_key in self.all_keys and new_key not in rename_map.keys():
+                conflicts.append(f'"{new_key}" already exists')
+        
+        if conflicts:
+            QMessageBox.warning(
+                self,
+                'Naming Conflict',
+                f'Cannot rename keys due to conflicts:\n\n' + '\n'.join(conflicts) +
+                '\n\nPlease choose different names.'
+            )
+            return
+        
+        # Confirm rename
+        rename_list = '\n'.join([f'  • "{old}" → "{new}"' for old, new in rename_map.items()])
+        reply = QMessageBox.question(
+            self,
+            'Confirm Key Rename',
+            f'Are you sure you want to rename {len(rename_map)} key(s) in all {len(self.all_data)} records?\n\n'
+            f'{rename_list}\n\n'
+            f'This action will modify your data.',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        try:
+            # Rename keys in all_data
+            for row in self.all_data:
+                for old_key, new_key in rename_map.items():
+                    if old_key in row:
+                        row[new_key] = row.pop(old_key)
+            
+            # Update all_keys list
+            self.all_keys = [rename_map.get(key, key) for key in self.all_keys]
+            
+            # Update original_geojson if it exists
+            if self.original_geojson and 'features' in self.original_geojson:
+                for feature in self.original_geojson['features']:
+                    if 'properties' in feature:
+                        for old_key, new_key in rename_map.items():
+                            if old_key in feature['properties']:
+                                feature['properties'][new_key] = feature['properties'].pop(old_key)
+            
+            # Mark as modified
+            self.data_modified = True
+            self.save_btn.setEnabled(True)
+            
+            # Refresh display
+            self.display_page()
+            
+            # Update status
+            self.statusBar().showMessage(f'Renamed {len(rename_map)} key(s) in {len(self.all_data)} records')
+            self.file_label.setText(f'Loaded: {len(self.all_data)} records with {len(self.all_keys)} columns')
+            
+            QMessageBox.information(
+                self,
+                'Keys Renamed',
+                f'Successfully renamed {len(rename_map)} key(s) in all records.\n\n'
+                f'Remember to save your changes.'
+            )
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                'Error',
+                f'Failed to rename keys:\n{str(e)}'
+            )
+    
     def export_minified(self):
         """Export GeoJSON as minified (no indentation) for smaller file size"""
         if not self.all_data:
@@ -1548,16 +1780,18 @@ class GeoJSONViewer(QMainWindow):
         
         try:
             # Prepare data to export
+            import copy
             if self.original_geojson:
-                # Update the original GeoJSON with current data
-                if 'features' in self.original_geojson:
-                    for i, feature in enumerate(self.original_geojson['features']):
+                # Create a deep copy to avoid modifying the original
+                export_data = copy.deepcopy(self.original_geojson)
+                # Update the copy with current data
+                if 'features' in export_data:
+                    for i, feature in enumerate(export_data['features']):
                         if i < len(self.all_data):
                             if 'properties' in feature:
                                 feature['properties'] = self.all_data[i]
                             else:
-                                self.original_geojson['features'][i] = self.all_data[i]
-                export_data = self.original_geojson
+                                export_data['features'][i] = self.all_data[i]
             else:
                 # Create basic GeoJSON structure
                 export_data = {
@@ -1571,57 +1805,352 @@ class GeoJSONViewer(QMainWindow):
                     ]
                 }
             
-            # Calculate file sizes for comparison
-            import io
+            # Disable export button during export
+            self.export_minified_btn.setEnabled(False)
+            self.save_progress_bar.setVisible(True)
+            self.save_progress_bar.setValue(0)
+            self.save_status_label.setText('Exporting...')
+            self.statusBar().showMessage('Exporting minified JSON in background...')
             
-            # Normal size (with indentation)
-            normal_buffer = io.StringIO()
-            json.dump(export_data, normal_buffer, ensure_ascii=False, indent=2)
-            normal_size = len(normal_buffer.getvalue().encode('utf-8'))
+            # Export in background thread
+            self.exporter = MinifiedExporter(file_path, export_data)
+            self.exporter.progress.connect(self.on_export_progress)
+            self.exporter.finished.connect(self.on_export_finished)
+            self.exporter.error.connect(self.on_export_error)
+            self.exporter.start()
             
-            # Minified size (no indentation)
-            minified_buffer = io.StringIO()
-            json.dump(export_data, minified_buffer, ensure_ascii=False, separators=(',', ':'))
-            minified_size = len(minified_buffer.getvalue().encode('utf-8'))
-            
-            # Save minified version
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f, ensure_ascii=False, separators=(',', ':'))
-            
-            # Calculate size reduction
-            size_reduction = normal_size - minified_size
-            reduction_percent = (size_reduction / normal_size * 100) if normal_size > 0 else 0
-            
-            # Format sizes for display
-            def format_size(size_bytes):
-                if size_bytes < 1024:
-                    return f'{size_bytes} B'
-                elif size_bytes < 1024 * 1024:
-                    return f'{size_bytes / 1024:.2f} KB'
-                else:
-                    return f'{size_bytes / (1024 * 1024):.2f} MB'
-            
-            self.statusBar().showMessage(
-                f'Exported minified JSON: {format_size(minified_size)} '
-                f'(saved {format_size(size_reduction)}, {reduction_percent:.1f}% smaller)'
+        except Exception as e:
+            self.save_progress_bar.setVisible(False)
+            self.save_status_label.setText('')
+            self.export_minified_btn.setEnabled(True)
+            QMessageBox.critical(self, 'Error', f'Failed to start export:\n{str(e)}')
+    
+    def on_export_progress(self, value, message):
+        """Update export progress"""
+        self.save_progress_bar.setValue(value)
+        self.save_status_label.setText(message)
+        self.statusBar().showMessage(message)
+    
+    def on_export_finished(self, file_path, normal_size, minified_size, size_reduction):
+        """Handle export completion"""
+        self.save_progress_bar.setVisible(False)
+        self.save_status_label.setText('✓ Export complete')
+        self.export_minified_btn.setEnabled(True)
+        
+        # Calculate reduction percent
+        reduction_percent = (size_reduction / normal_size * 100) if normal_size > 0 else 0
+        
+        # Format sizes for display
+        def format_size(size_bytes):
+            if size_bytes < 1024:
+                return f'{size_bytes} B'
+            elif size_bytes < 1024 * 1024:
+                return f'{size_bytes / 1024:.2f} KB'
+            else:
+                return f'{size_bytes / (1024 * 1024):.2f} MB'
+        
+        self.statusBar().showMessage(
+            f'Exported minified JSON: {format_size(minified_size)} '
+            f'(saved {format_size(size_reduction)}, {reduction_percent:.1f}% smaller)'
+        )
+        
+        QMessageBox.information(
+            self,
+            'Export Complete',
+            f'Successfully exported minified GeoJSON!\n\n'
+            f'File: {os.path.basename(file_path)}\n'
+            f'Normal size: {format_size(normal_size)}\n'
+            f'Minified size: {format_size(minified_size)}\n'
+            f'Size reduction: {format_size(size_reduction)} ({reduction_percent:.1f}% smaller)'
+        )
+        
+        # Clear export status after 3 seconds
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(3000, lambda: self.save_status_label.setText(''))
+    
+    def on_export_error(self, error_msg):
+        """Handle export error"""
+        self.save_progress_bar.setVisible(False)
+        self.save_status_label.setText('✗ Export failed')
+        self.export_minified_btn.setEnabled(True)
+        self.statusBar().showMessage('Export failed')
+        QMessageBox.critical(self, 'Error', f'Failed to export minified JSON:\n{error_msg}')
+    
+    def export_coordinates_dialog(self):
+        """Show dialog to select export format for coordinates"""
+        if not self.original_geojson or 'features' not in self.original_geojson:
+            QMessageBox.warning(
+                self,
+                'No Geometry Data',
+                'No GeoJSON geometry data found. Please load a valid GeoJSON file with polygon features.'
             )
+            return
+        
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Export Center Coordinates')
+        dialog.setMinimumWidth(450)
+        
+        layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel(
+            'Export the center coordinates (latitude, longitude) from polygon geometries.\n'
+            'The center point will be calculated from each polygon\'s centroid.'
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet('padding: 10px;')
+        layout.addWidget(instructions)
+        
+        # Format selection
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel('Export Format:'))
+        
+        format_combo = QComboBox()
+        format_combo.addItems(['CSV (Comma-Separated)', 'JSON (Point GeoJSON)', 'TXT (Tab-Separated)'])
+        format_layout.addWidget(format_combo)
+        layout.addLayout(format_layout)
+        
+        # Include properties option
+        include_props_check = QComboBox()
+        include_props_check.addItems(['Coordinates only', 'Include all properties'])
+        include_props_check.setCurrentIndex(1)
+        
+        props_layout = QHBoxLayout()
+        props_layout.addWidget(QLabel('Data to export:'))
+        props_layout.addWidget(include_props_check)
+        layout.addLayout(props_layout)
+        
+        # Info label
+        info_label = QLabel(f'Found {len(self.original_geojson["features"])} features to process')
+        info_label.setStyleSheet('color: gray; font-style: italic; padding: 5px;')
+        layout.addWidget(info_label)
+        
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            export_format = format_combo.currentIndex()  # 0=CSV, 1=JSON, 2=TXT
+            include_properties = include_props_check.currentIndex() == 1
+            self.export_coordinates(export_format, include_properties)
+    
+    def export_coordinates(self, export_format, include_properties):
+        """Export center coordinates from polygons"""
+        try:
+            features = self.original_geojson.get('features', [])
+            
+            if not features:
+                QMessageBox.warning(self, 'No Features', 'No features found in GeoJSON.')
+                return
+            
+            # Calculate center coordinates for each feature
+            coordinates_data = []
+            
+            for idx, feature in enumerate(features):
+                geom = feature.get('geometry', {})
+                props = feature.get('properties', {})
+                
+                if not geom or geom.get('type') not in ['Polygon', 'MultiPolygon']:
+                    continue
+                
+                # Calculate centroid
+                lat, lon = self.calculate_polygon_center(geom)
+                
+                if lat is None or lon is None:
+                    continue
+                
+                # Prepare data row
+                data_row = {
+                    'latitude': lat,
+                    'longitude': lon
+                }
+                
+                if include_properties:
+                    # Add all properties
+                    data_row.update(props)
+                
+                coordinates_data.append(data_row)
+            
+            if not coordinates_data:
+                QMessageBox.warning(
+                    self,
+                    'No Coordinates',
+                    'No valid polygon coordinates found to export.'
+                )
+                return
+            
+            # Ask user where to save
+            default_name = ''
+            if self.current_file_path:
+                base_name = os.path.splitext(self.current_file_path)[0]
+                if export_format == 0:  # CSV
+                    default_name = base_name + '_coordinates.csv'
+                elif export_format == 1:  # JSON
+                    default_name = base_name + '_coordinates.geojson'
+                else:  # TXT
+                    default_name = base_name + '_coordinates.txt'
+            else:
+                if export_format == 0:
+                    default_name = 'coordinates.csv'
+                elif export_format == 1:
+                    default_name = 'coordinates.geojson'
+                else:
+                    default_name = 'coordinates.txt'
+            
+            if export_format == 0:
+                file_filter = 'CSV Files (*.csv);;All Files (*)'
+            elif export_format == 1:
+                file_filter = 'GeoJSON Files (*.json *.geojson);;All Files (*)'
+            else:
+                file_filter = 'Text Files (*.txt);;All Files (*)'
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                'Export Coordinates',
+                default_name,
+                file_filter
+            )
+            
+            if not file_path:
+                return
+            
+            # Export based on format
+            if export_format == 0:  # CSV
+                self.export_coordinates_csv(file_path, coordinates_data)
+            elif export_format == 1:  # JSON (Point GeoJSON)
+                self.export_coordinates_geojson(file_path, coordinates_data)
+            else:  # TXT
+                self.export_coordinates_txt(file_path, coordinates_data)
+            
+            self.statusBar().showMessage(f'Exported {len(coordinates_data)} coordinates to {os.path.basename(file_path)}')
             
             QMessageBox.information(
                 self,
                 'Export Complete',
-                f'Successfully exported minified GeoJSON!\n\n'
+                f'Successfully exported {len(coordinates_data)} center coordinates!\n\n'
                 f'File: {os.path.basename(file_path)}\n'
-                f'Normal size: {format_size(normal_size)}\n'
-                f'Minified size: {format_size(minified_size)}\n'
-                f'Size reduction: {format_size(size_reduction)} ({reduction_percent:.1f}% smaller)'
+                f'Format: {"CSV" if export_format == 0 else "GeoJSON" if export_format == 1 else "TXT"}'
             )
         
         except Exception as e:
             QMessageBox.critical(
                 self,
                 'Export Error',
-                f'Failed to export minified JSON:\n{str(e)}'
+                f'Failed to export coordinates:\n{str(e)}'
             )
+    
+    def calculate_polygon_center(self, geometry):
+        """Calculate the center point (centroid) of a polygon"""
+        try:
+            geom_type = geometry.get('type')
+            coords = geometry.get('coordinates', [])
+            
+            if not coords:
+                return None, None
+            
+            all_lats = []
+            all_lons = []
+            
+            if geom_type == 'Polygon':
+                # Get exterior ring (first array)
+                if coords and len(coords) > 0:
+                    for point in coords[0]:
+                        if len(point) >= 2:
+                            all_lons.append(point[0])
+                            all_lats.append(point[1])
+            
+            elif geom_type == 'MultiPolygon':
+                # Process all polygons
+                for polygon in coords:
+                    if polygon and len(polygon) > 0:
+                        for point in polygon[0]:  # Exterior ring
+                            if len(point) >= 2:
+                                all_lons.append(point[0])
+                                all_lats.append(point[1])
+            
+            if not all_lats or not all_lons:
+                return None, None
+            
+            # Calculate centroid (simple average)
+            center_lat = sum(all_lats) / len(all_lats)
+            center_lon = sum(all_lons) / len(all_lons)
+            
+            return center_lat, center_lon
+        
+        except Exception as e:
+            print(f"Error calculating center: {e}")
+            return None, None
+    
+    def export_coordinates_csv(self, file_path, coordinates_data):
+        """Export coordinates to CSV format"""
+        import csv
+        
+        if not coordinates_data:
+            return
+        
+        # Get all keys (columns)
+        all_keys = list(coordinates_data[0].keys())
+        
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=all_keys)
+            writer.writeheader()
+            writer.writerows(coordinates_data)
+    
+    def export_coordinates_txt(self, file_path, coordinates_data):
+        """Export coordinates to tab-separated TXT format"""
+        if not coordinates_data:
+            return
+        
+        # Get all keys (columns)
+        all_keys = list(coordinates_data[0].keys())
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            # Write header
+            f.write('\t'.join(all_keys) + '\n')
+            
+            # Write data rows
+            for row in coordinates_data:
+                values = [str(row.get(key, '')) for key in all_keys]
+                f.write('\t'.join(values) + '\n')
+    
+    def export_coordinates_geojson(self, file_path, coordinates_data):
+        """Export GeoJSON with original polygons and center coordinates added to properties"""
+        if not coordinates_data:
+            return
+        
+        import copy
+        
+        # Create a deep copy of original GeoJSON to preserve polygons
+        geojson = copy.deepcopy(self.original_geojson)
+        
+        # Add center coordinates to each feature's properties
+        coord_index = 0
+        for feature in geojson.get('features', []):
+            geom = feature.get('geometry', {})
+            
+            # Only process features with polygon geometry
+            if geom and geom.get('type') in ['Polygon', 'MultiPolygon']:
+                if coord_index < len(coordinates_data):
+                    coord_data = coordinates_data[coord_index]
+                    
+                    # Add center coordinates to properties
+                    if 'properties' not in feature:
+                        feature['properties'] = {}
+                    
+                    feature['properties']['center_latitude'] = coord_data.get('latitude')
+                    feature['properties']['center_longitude'] = coord_data.get('longitude')
+                    
+                    coord_index += 1
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(geojson, f, ensure_ascii=False, indent=2)
 
 
 def main():
